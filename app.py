@@ -1,0 +1,697 @@
+"""HydroBridge web UI — pick a bridge site on a map and run screening."""
+
+from __future__ import annotations
+
+import json
+import logging
+import multiprocessing
+import os
+import pickle
+import re
+import secrets
+import shutil
+import tempfile
+import threading
+from base64 import b64encode
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+import requests
+from flask import Flask, Response, abort, jsonify, render_template, request, send_from_directory, stream_with_context
+
+from hydroscreen import (
+    HydroScreenCancelled,
+    HydroScreenError,
+    iter_dem_preview,
+    lookup_niwa_flood,
+    normalize_flow_scenarios,
+    plan_linz_clip,
+    parse_aoi_extent,
+    parse_user_slope,
+    preview_dem_overlay,
+    sample_drawn_cross_section,
+    screening_process_main,
+)
+
+ROOT = Path(__file__).resolve().parent
+OUTPUTS = ROOT / "outputs"
+NOMINATIM = "https://nominatim.openstreetmap.org"
+NOMINATIM_HEADERS = {"User-Agent": "HydroBridge/0.1 (hydraulic screening)"}
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+_OUTPUT_NAME_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{n}" for n in range(1, 10)),
+    *(f"LPT{n}" for n in range(1, 10)),
+}
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_active_jobs = {}
+_active_jobs_lock = threading.Lock()
+_cancelled_job_ids = deque(maxlen=50)
+_cancelled_job_lookup = set()
+
+
+def _new_run_id():
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{secrets.token_hex(3)}"
+
+
+def output_folder_name(bridge_name):
+    """Filesystem folder for one screening run, taken from the bridge name."""
+    text = _OUTPUT_NAME_BAD.sub(" ", str(bridge_name or ""))
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    if not text or text.upper() in _WINDOWS_RESERVED:
+        return _new_run_id()
+    return text[:80].strip(" .") or _new_run_id()
+
+
+def unique_output_folder(bridge_name, root=None):
+    """Pick outputs/<bridge name>, adding (2), (3), … when that folder exists."""
+    base = output_folder_name(bridge_name)
+    folder = Path(root) if root is not None else OUTPUTS
+    candidate = base
+    number = 2
+    while (folder / candidate).exists():
+        suffix = f" ({number})"
+        candidate = f"{base[:80 - len(suffix)].rstrip(' .')}{suffix}"
+        number += 1
+        if number > 100:
+            candidate = f"{base[:40].rstrip(' .')} {_new_run_id()}"
+            break
+    return candidate
+
+
+def _safe_output_name(name):
+    if not name or name in {".", ".."} or len(name) > 120:
+        return False
+    if name != name.strip(" .") or _OUTPUT_NAME_BAD.search(name):
+        return False
+    if name.upper() in _WINDOWS_RESERVED:
+        return False
+    return True
+
+
+def _result_url(run_id, filename):
+    return f"/results/{quote(str(run_id), safe='')}/{quote(Path(filename).name, safe='')}"
+
+
+def _parse_job_id():
+    job_id = (request.form.get("job_id") or "").strip()
+    if not job_id:
+        payload = request.get_json(silent=True) or {}
+        job_id = str(payload.get("job_id") or "").strip()
+    if JOB_ID_RE.match(job_id):
+        return job_id
+    return None
+
+
+def _remember_cancel(job_id):
+    if job_id in _cancelled_job_lookup:
+        return
+    if len(_cancelled_job_ids) == _cancelled_job_ids.maxlen:
+        _cancelled_job_lookup.discard(_cancelled_job_ids[0])
+    _cancelled_job_ids.append(job_id)
+    _cancelled_job_lookup.add(job_id)
+
+
+def _forget_cancel(job_id):
+    _cancelled_job_lookup.discard(job_id)
+
+
+def _signal_stop(proc):
+    """Ask a screening process to exit. The request that started it reaps it."""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+    except (OSError, ValueError):
+        return
+
+
+def _close_process(proc):
+    if proc is None:
+        return
+    try:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(2)
+        else:
+            proc.join(0.2)
+        proc.close()
+    except (OSError, ValueError):
+        pass
+
+
+def _supervise_process(proc, cancel_event):
+    """Wait until the screening process ends, or kill it when stop is requested."""
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            _signal_stop(proc)
+            try:
+                proc.join(2)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(2)
+            except (OSError, ValueError):
+                pass
+            raise HydroScreenCancelled("Screening stopped.")
+        if not proc.is_alive():
+            break
+        proc.join(0.2)
+    if cancel_event is not None and cancel_event.is_set():
+        raise HydroScreenCancelled("Screening stopped.")
+
+
+def _start_screening_process(kwargs, result_path):
+    proc = multiprocessing.Process(
+        target=screening_process_main,
+        args=(kwargs, result_path),
+        daemon=True,
+    )
+    proc.start()
+    return proc
+
+
+def _read_screening_payload(result_path, proc):
+    path = Path(result_path)
+    if not path.exists() or path.stat().st_size == 0:
+        raise HydroScreenError(
+            f"Screening ended before it could finish (exit {proc.exitcode}). Run it again."
+        )
+    with path.open("rb") as handle:
+        payload = pickle.load(handle)
+    if payload.get("cancelled"):
+        raise HydroScreenCancelled(payload["cancelled"])
+    if payload.get("error"):
+        if payload.get("status") == 400:
+            raise HydroScreenError(payload["error"])
+        raise RuntimeError(payload["error"])
+    if "ok" not in payload:
+        raise HydroScreenError("Screening ended before it could finish. Run it again.")
+    return payload["ok"]
+
+
+def _claim_job(job_id, job):
+    """Register this run and stop any screening that is already in progress."""
+    stale = []
+    with _active_jobs_lock:
+        if job_id in _cancelled_job_lookup:
+            return False
+        for existing in _active_jobs.values():
+            existing["event"].set()
+            stale.append(existing.get("process"))
+        _active_jobs[job_id] = job
+    for proc in stale:
+        _signal_stop(proc)
+    return True
+
+
+def _stop_job(job_id):
+    _remember_cancel(job_id)
+    with _active_jobs_lock:
+        job = _active_jobs.get(job_id)
+    if job is None:
+        return
+    job["event"].set()
+    _signal_stop(job.get("process"))
+    logging.info("Stop requested for screening job %s", job_id)
+
+
+@app.post("/api/stop")
+def stop_run():
+    job_id = _parse_job_id()
+    if not job_id:
+        return jsonify({"error": "Missing screening job."}), 400
+    _stop_job(job_id)
+    return jsonify({"cancelled": True})
+
+
+@app.get("/")
+def index():
+    return render_template("index.html")
+
+
+@app.get("/api/search")
+def search_places():
+    query = (request.args.get("q") or "").strip()
+    if len(query) < 2:
+        return jsonify([])
+    try:
+        response = requests.get(
+            f"{NOMINATIM}/search",
+            params={"q": query, "format": "jsonv2", "limit": 6, "addressdetails": 0},
+            headers=NOMINATIM_HEADERS,
+            timeout=20,
+        )
+        response.raise_for_status()
+        hits = []
+        for item in response.json():
+            hits.append({
+                "label": item.get("display_name"),
+                "lat": float(item["lat"]),
+                "lon": float(item["lon"]),
+            })
+        return jsonify(hits)
+    except Exception as exc:
+        logging.warning("Place search failed: %s", exc)
+        return jsonify({"error": "Place search is unavailable right now."}), 502
+
+
+@app.get("/api/reverse")
+def reverse_geocode():
+    try:
+        lat = float(request.args.get("lat"))
+        lon = float(request.args.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "lat and lon are required numbers."}), 400
+    try:
+        response = requests.get(
+            f"{NOMINATIM}/reverse",
+            params={"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 16},
+            headers=NOMINATIM_HEADERS,
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return jsonify({"label": data.get("display_name") or "Selected location"})
+    except Exception as exc:
+        logging.warning("Reverse geocode failed: %s", exc)
+        return jsonify({"label": None})
+
+
+def _parse_centerline(raw):
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HydroScreenError("The drawn river line could not be read. Clear it and draw again.")
+    if not isinstance(parsed, list):
+        raise HydroScreenError("The river centreline must be a list of points.")
+    if len(parsed) > 500:
+        raise HydroScreenError("The drawn river line has too many points. Clear it and draw a simpler line.")
+    if len(parsed) < 2:
+        return None
+    return parsed
+
+
+def _parse_aoi(src):
+    return {
+        "upstream_m": parse_aoi_extent(src.get("upstream"), name="Upstream limit"),
+        "downstream_m": parse_aoi_extent(src.get("downstream"), name="Downstream limit"),
+        "lateral_m": parse_aoi_extent(src.get("lateral"), name="Lateral extent"),
+        "centerline_coords": _parse_centerline((src.get("centerline") or "").strip()),
+    }
+
+
+def _dem_tile_payload(lat, lon, aoi):
+    plan = plan_linz_clip(
+        lat,
+        lon,
+        upstream_m=aoi["upstream_m"],
+        downstream_m=aoi["downstream_m"],
+        lateral_m=aoi["lateral_m"],
+        centerline_coords=aoi["centerline_coords"],
+    )
+    tiles = list(plan["tiles"])
+    return {
+        "tiles": tiles,
+        "files": [f"{code}.tiff" for code in tiles],
+    }
+
+
+@app.route("/api/dem-tiles", methods=["GET", "POST"])
+def dem_tiles():
+    """Topo50 sheet files the DEM download will open. Does not fetch rasters."""
+    src = request.form if request.method == "POST" else request.args
+    try:
+        lat = float(src.get("lat"))
+        lon = float(src.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Enter a valid latitude and longitude, or click the map."}), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify({"error": "Latitude must be between -90 and 90, longitude between -180 and 180."}), 400
+    try:
+        aoi = _parse_aoi(src)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(_dem_tile_payload(lat, lon, aoi))
+
+
+def _preview_payload(result):
+    west, south, east, north = result["bounds"]
+    return {
+        "png": b64encode(result["png"]).decode("ascii"),
+        "bounds": [[south, west], [north, east]],
+        "source": result["source"],
+        "radius_m": result["radius_m"],
+        "clip_size_m": result.get("clip_size_m"),
+        "upstream_m": result.get("upstream_m"),
+        "downstream_m": result.get("downstream_m"),
+        "lateral_m": result.get("lateral_m"),
+        "tiles": result.get("tiles") or [],
+        "aoi": result.get("aoi"),
+    }
+
+
+@app.route("/api/dem-preview", methods=["GET", "POST"])
+def dem_preview():
+    src = request.form if request.method == "POST" else request.args
+    try:
+        lat = float(src.get("lat"))
+        lon = float(src.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Enter a valid latitude and longitude, or click the map."}), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify({"error": "Latitude must be between -90 and 90, longitude between -180 and 180."}), 400
+    try:
+        along_m = float(src.get("along") or 300)
+        length = float(src.get("length") or 200)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Screening options must be numbers."}), 400
+    if along_m < 0 or length <= 0:
+        return jsonify({"error": "Transect length and length along the river must be greater than 0."}), 400
+    try:
+        aoi = _parse_aoi(src)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    stream = (src.get("stream") or request.args.get("stream") or "").strip() == "1"
+    if stream:
+        def generate():
+            try:
+                for event in iter_dem_preview(
+                    lat,
+                    lon,
+                    along_m=along_m,
+                    length=length,
+                    **aoi,
+                ):
+                    if event.get("done"):
+                        payload = _preview_payload(event)
+                        payload["percent"] = 100
+                        payload["message"] = event.get("message") or "DEM ready"
+                        payload["done"] = True
+                        yield json.dumps(payload) + "\n"
+                    else:
+                        progress = {
+                            "percent": int(event.get("percent") or 0),
+                            "message": event.get("message") or "Downloading DEM…",
+                        }
+                        if event.get("tiles"):
+                            progress["tiles"] = list(event["tiles"])
+                            progress["files"] = [f"{code}.tiff" for code in event["tiles"]]
+                        yield json.dumps(progress) + "\n"
+            except HydroScreenError as exc:
+                yield json.dumps({"error": str(exc), "percent": 0, "done": True}) + "\n"
+            except Exception as exc:
+                logging.exception("DEM preview failed")
+                yield json.dumps({
+                    "error": f"Could not overlay the DEM: {exc}",
+                    "percent": 0,
+                    "done": True,
+                }) + "\n"
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    try:
+        result = preview_dem_overlay(lat, lon, along_m=along_m, length=length, **aoi)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("DEM preview failed")
+        return jsonify({"error": f"Could not overlay the DEM: {exc}"}), 500
+
+    payload = _preview_payload(result)
+    payload["opacity"] = 0.5
+    return jsonify(payload)
+
+
+@app.post("/api/cross-section")
+def cross_section():
+    try:
+        lon1 = float(request.form.get("lon1"))
+        lat1 = float(request.form.get("lat1"))
+        lon2 = float(request.form.get("lon2"))
+        lat2 = float(request.form.get("lat2"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Click two points on the map to draw a cross-section."}), 400
+    if not (
+        -90 <= lat1 <= 90 and -90 <= lat2 <= 90 and -180 <= lon1 <= 180 and -180 <= lon2 <= 180
+    ):
+        return jsonify({"error": "Cross-section coordinates are out of range."}), 400
+    try:
+        spacing = float(request.form.get("sample_spacing") or 1)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Sample spacing must be a number."}), 400
+    if spacing <= 0:
+        return jsonify({"error": "Sample spacing must be greater than 0."}), 400
+
+    site_lat = site_lon = None
+    try:
+        if request.form.get("lat") not in (None, "") and request.form.get("lon") not in (None, ""):
+            site_lat = float(request.form.get("lat"))
+            site_lon = float(request.form.get("lon"))
+            if not (-90 <= site_lat <= 90 and -180 <= site_lon <= 180):
+                site_lat = site_lon = None
+    except (TypeError, ValueError):
+        site_lat = site_lon = None
+
+    try:
+        aoi = _parse_aoi(request.form)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        profile = sample_drawn_cross_section(
+            lon1,
+            lat1,
+            lon2,
+            lat2,
+            spacing_m=spacing,
+            site_lat=site_lat,
+            site_lon=site_lon,
+            **aoi,
+        )
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("Cross-section sampling failed")
+        return jsonify({"error": f"Could not sample the DEM: {exc}"}), 500
+    return jsonify(profile)
+
+
+@app.post("/api/hydrology")
+def hydrology():
+    """Nearest NIWA Henderson & Collins REC1 reach and its design flows."""
+    try:
+        lat = float(request.form.get("lat"))
+        lon = float(request.form.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Pin a bridge before looking up flood flows."}), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify({"error": "Latitude must be between -90 and 90, longitude between -180 and 180."}), 400
+    try:
+        return jsonify(lookup_niwa_flood(lat, lon))
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("NIWA flood lookup failed")
+        return jsonify({"error": f"Could not look up NIWA flood flows: {exc}"}), 500
+
+
+@app.post("/api/run")
+def run():
+    try:
+        lat = float(request.form.get("lat"))
+        lon = float(request.form.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Enter a valid latitude and longitude, or click the map."}), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify({"error": "Latitude must be between -90 and 90, longitude between -180 and 180."}), 400
+
+    run_id = unique_output_folder((request.form.get("bridge_name") or "").strip())
+    outdir = OUTPUTS / run_id
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        interval = float(request.form.get("interval") or 50)
+        along_raw = request.form.get("along")
+        along_m = float(along_raw) if along_raw not in (None, "") else 300.0
+        length = float(request.form.get("length") or 200)
+        sample_spacing = float(request.form.get("sample_spacing") or 1)
+        mannings_n = float(request.form.get("mannings_n") or 0.035)
+        flow_m3_s = float(request.form.get("flow") or 10)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Screening options must be numbers."}), 400
+    if interval <= 0 or along_m < 0 or length <= 0 or sample_spacing <= 0:
+        return jsonify({"error": "Transect length and spacing must be greater than 0."}), 400
+    if mannings_n <= 0 or flow_m3_s < 0:
+        return jsonify({"error": "Flow rate must be ≥ 0 and Manning's n must be greater than 0."}), 400
+
+    slope_mode = (request.form.get("slope_mode") or "calculated").strip().lower()
+    user_slope = None
+    if slope_mode == "specified":
+        raw_slope = request.form.get("slope")
+        if raw_slope in (None, ""):
+            return jsonify({
+                "error": "Enter a slope greater than 0 and at most 1 (m/m), or use the calculated centreline slope.",
+            }), 400
+        try:
+            user_slope = parse_user_slope(raw_slope)
+        except HydroScreenError as exc:
+            return jsonify({"error": str(exc)}), 400
+    elif slope_mode != "calculated":
+        return jsonify({"error": "Choose a calculated centreline slope or a specified slope."}), 400
+
+    parsed_aris = None
+    raw_aris = (request.form.get("aris") or "").strip()
+    if raw_aris:
+        try:
+            parsed_aris = json.loads(raw_aris)
+        except json.JSONDecodeError:
+            return jsonify({"error": "Return periods could not be read. Select them again."}), 400
+    try:
+        flow_scenarios = normalize_flow_scenarios(flow_m3_s, parsed_aris)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    flow_m3_s = flow_scenarios[0]["flow_m3_s"]
+
+    try:
+        aoi = _parse_aoi(request.form)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    centerline_coords = aoi["centerline_coords"]
+    if (request.form.get("centerline") or "").strip() and centerline_coords is None:
+        return jsonify({"error": "The drawn river line is too short. Add more points along the channel."}), 400
+
+    job_id = _parse_job_id() or secrets.token_hex(8)
+    cancel_event = threading.Event()
+    job = {"event": cancel_event, "process": None}
+    if not _claim_job(job_id, job):
+        shutil.rmtree(outdir, ignore_errors=True)
+        return jsonify({"cancelled": True, "error": "Screening stopped."}), 409
+    result_path = None
+    try:
+        fd, result_path = tempfile.mkstemp(prefix="hydrobridge-run-", suffix=".pkl")
+        os.close(fd)
+        proc = _start_screening_process(
+            {
+                "lat": lat,
+                "lon": lon,
+                "outdir": str(outdir),
+                "interval": interval,
+                "along_m": along_m,
+                "length": length,
+                "sample_spacing": sample_spacing,
+                "mannings_n": mannings_n,
+                "flow_m3_s": flow_m3_s,
+                "flow_scenarios": flow_scenarios,
+                "slope": user_slope,
+                "centerline_coords": centerline_coords,
+                "upstream_m": aoi["upstream_m"],
+                "downstream_m": aoi["downstream_m"],
+                "lateral_m": aoi["lateral_m"],
+                "bridge_name": (request.form.get("bridge_name") or "").strip()[:120] or None,
+            },
+            result_path,
+        )
+        job["process"] = proc
+        try:
+            if cancel_event.is_set():
+                _signal_stop(proc)
+                raise HydroScreenCancelled("Screening stopped.")
+            _supervise_process(proc, cancel_event)
+            result = _read_screening_payload(result_path, proc)
+        finally:
+            _close_process(proc)
+    except HydroScreenCancelled:
+        shutil.rmtree(outdir, ignore_errors=True)
+        return jsonify({"cancelled": True, "error": "Screening stopped."}), 409
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("Screening failed")
+        return jsonify({"error": f"Screening failed: {exc}"}), 500
+    finally:
+        if result_path:
+            Path(result_path).unlink(missing_ok=True)
+            Path(result_path).with_suffix(".tmp").unlink(missing_ok=True)
+        with _active_jobs_lock:
+            if _active_jobs.get(job_id) is job:
+                _active_jobs.pop(job_id, None)
+            _forget_cancel(job_id)
+
+    public_summary = []
+    for row in result["summary"]:
+        public_summary.append({
+            "transect": row.get("transect"),
+            "offset_m": row.get("offset_m"),
+            "width_m": row.get("width_m"),
+            "area_m2": row.get("area_m2"),
+            "depth_mean_m": row.get("depth_mean_m"),
+            "max_depth_m": row.get("max_depth_m"),
+            "water_level_m": row.get("water_level_m"),
+            "hydraulic_radius_m": row.get("hydraulic_radius_m"),
+            "velocity_m_s": row.get("velocity_m_s"),
+            "discharge_m3_s": row.get("discharge_m3_s"),
+            "target_discharge_m3_s": row.get("target_discharge_m3_s"),
+            "slope": row.get("slope"),
+            "conveys": row.get("conveys"),
+            "overtopped": row.get("overtopped"),
+            "n_samples": row.get("n_samples"),
+            "aris": row.get("aris") or {},
+            "plot": _result_url(run_id, Path(row["plot"]).name),
+            "csv": _result_url(run_id, Path(row["csv"]).name),
+        })
+
+    return jsonify({
+        "run_id": run_id,
+        "lat": lat,
+        "lon": lon,
+        "centerline_source": result["centerline_source"],
+        "used_synthetic_centerline": result["used_synthetic_centerline"],
+        "layout": result.get("layout"),
+        "centerline": result["centerline"],
+        "centerline_profile": result.get("centerline_profile"),
+        "transects": [
+            {
+                **feat,
+                "plot": _result_url(run_id, feat["plot"]),
+                "csv": _result_url(run_id, feat["csv"]),
+            }
+            for feat in result["transects"]
+        ],
+        "summary": public_summary,
+        "summary_xlsx": _result_url(run_id, result["summary_xlsx"]),
+    })
+
+
+@app.get("/results/<run_id>/<path:filename>")
+def result_file(run_id, filename):
+    if not _safe_output_name(run_id):
+        abort(404)
+    if Path(filename).name != filename:
+        abort(404)
+    return send_from_directory(OUTPUTS / run_id, filename)
+
+
+if __name__ == "__main__":
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)

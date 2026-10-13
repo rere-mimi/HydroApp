@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HydroBridge</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=scroll-end">
+</head>
+<body>
+  <div class="app-frame">
+  <header class="chrome">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"><span class="eight">8</span></span>
+      <div>
+        <strong>HydroBridge</strong>
+        <span>Hydraulic screening</span>
+      </div>
+    </div>
+    <form id="search-form" class="search" autocomplete="off">
+      <label class="sr-only" for="search-q">Search for a place or river</label>
+      <input id="search-q" name="q" type="search" placeholder="Search a place or river…" enterkeyhint="search">
+      <button type="submit">Find</button>
+      <ul id="search-results" class="search-results" hidden></ul>
+    </form>
+  </header>
+
+  <div class="workspace">
+  <aside class="rail rail-start">
+  <aside id="coach" class="card coach" aria-live="polite">
+    <p id="map-hint" class="coach-copy">Navigate the map, then double-click a bridge to drop a pin.</p>
+    <p id="status" class="status" role="status"></p>
+    <div id="coach-actions" class="coach-actions" hidden>
+      <button type="button" id="undo-vertex" class="ghost" disabled>Undo last point</button>
+      <button type="button" id="clear-line" class="ghost" disabled>Clear line</button>
+      <button type="button" id="finish-line" class="secondary" disabled>Finish centreline</button>
+    </div>
+    <div id="tool-actions" class="coach-actions" hidden>
+      <button type="button" id="mode-draw" class="secondary" aria-pressed="false">Redraw centreline</button>
+      <button type="button" id="mode-xs" class="secondary" aria-pressed="false">Cross-section</button>
+      <button type="button" id="clear-xs" class="ghost" disabled>Clear section</button>
+    </div>
+  </aside>
+
+  <aside id="legend" class="card legend">
+    <h2>Legend</h2>
+    <ul id="legend-list">
+      <li data-key="basemap"><span class="swatch basemap map"></span> Google Map</li>
+    </ul>
+    <label id="dem-opacity-control" class="dem-opacity" hidden>
+      <span class="dem-opacity-label">
+        DEM transparency
+        <span id="dem-opacity-value">50%</span>
+      </span>
+      <input id="dem-opacity" type="range" min="0" max="100" value="50" step="1">
+    </label>
+  </aside>
+
+  <div class="basemap-switch" role="radiogroup" aria-label="Basemap">
+    <button type="button" data-basemap="map" aria-pressed="true">Map</button>
+    <button type="button" data-basemap="earth" aria-pressed="false">Earth</button>
+    <button type="button" data-basemap="topo" aria-pressed="false">Topo</button>
+  </div>
+  </aside>
+
+  <div class="map-stage">
+  <div id="map" role="application" aria-label="Map centred on Christchurch. Double-click to pin a bridge, then draw the river centreline."></div>
+  <div id="busy" class="busy" hidden role="status" aria-live="polite">
+    <span class="spinner" id="busy-spinner" aria-hidden="true"></span>
+    <div class="busy-copy">
+      <div class="busy-row">
+        <span id="busy-text">Working…</span>
+        <span id="busy-pct" hidden>0%</span>
+      </div>
+      <div id="busy-bar" class="progress" hidden>
+        <div id="busy-bar-fill" class="progress-fill"></div>
+      </div>
+    </div>
+  </div>
+  </div>
+
+  <form id="run-form" class="card params rail rail-end" hidden novalidate>
+    <div class="params-head">
+      <h2>Hydrology</h2>
+      <p id="bridge-summary" class="muted">Name a bridge, then set the DEM area of interest and draw its river centreline.</p>
+    </div>
+
+    <p class="analysis">
+      Analysis length
+      <strong id="analysis-length">—</strong>
+      <span class="muted">from the drawn centreline, plus 50 m at each end when you finish</span>
+    </p>
+    <p id="layout-preview" class="muted">Draw the centreline to set transect count.</p>
+
+    <fieldset class="field aoi-field">
+      <legend class="field-label">
+        DEM area of interest
+        <button type="button" class="help" aria-label="What is the DEM area of interest?" data-help="help-aoi">?</button>
+      </legend>
+      <span id="help-aoi" class="help-pop" role="tooltip" hidden>
+        The orange polygon is the clip window. Upstream, downstream, and lateral distances set its edges about the pin. Adjust those values (and the centreline heading) until the rectangle covers the reach you want. LiDAR is not downloaded while you draw. When the polygon looks right, click Clip DEM to download each LINZ 1 m sheet the rectangle touches, then crop that window from those files. Each side can be 10–5,000 m. For 1,500 m × 1,000 m use 750 m up, 750 m down, and 500 m each side.
+      </span>
+      <p class="muted">Draw the orange polygon first. Distances are from the pin, 10–5,000 m each. The rectangle rotates with the centreline. LiDAR downloads only when you click Clip DEM.</p>
+      <p id="aoi-size" class="muted">LiDAR window 500 m along × 500 m across.</p>
+      <label class="field">
+        <span class="field-label">Upstream limit</span>
+        <span class="unit-field">
+          <input name="upstream" type="number" step="1" min="10" max="5000" value="250">
+          <span>m</span>
+        </span>
+      </label>
+      <label class="field">
+        <span class="field-label">Downstream limit</span>
+        <span class="unit-field">
+          <input name="downstream" type="number" step="1" min="10" max="5000" value="250">
+          <span>m</span>
+        </span>
+      </label>
+      <label class="field">
+        <span class="field-label">Lateral extent</span>
+        <span class="unit-field">
+          <input name="lateral" type="number" step="1" min="10" max="5000" value="250">
+          <span>m</span>
+        </span>
+      </label>
+      <button type="button" id="clip-dem" class="secondary clip-dem">Clip DEM</button>
+      <p class="muted" id="dem-tiles" hidden></p>
+    </fieldset>
+
+    <label class="field">
+        <button type="button" class="help" aria-label="What is transect length?" data-help="help-length">?</button>
+      </span>
+      <span class="unit-field">
+        <input name="length" type="number" step="1" min="10" value="200">
+        <span>m</span>
+      </span>
+      <span id="help-length" class="help-pop" role="tooltip" hidden>
+        Width of each hydraulic cross-section, centred on the river. A 200 m transect extends 100 m to each bank.
+      </span>
+    </label>
+
+    <label class="field">
+      <span class="field-label">
+        Transect spacing
+        <button type="button" class="help" aria-label="What is transect spacing?" data-help="help-interval">?</button>
+      </span>
+      <span class="unit-field">
+        <input name="interval" type="number" step="1" min="1" value="50">
+        <span>m</span>
+      </span>
+      <span id="help-interval" class="help-pop" role="tooltip" hidden>
+        Distance along the centreline between consecutive cross-sections. Closer spacing gives more sections over the same drawn length.
+      </span>
+    </label>
+
+    <label class="field">
+      <span class="field-label">
+        Sample spacing
+        <button type="button" class="help" aria-label="What is sample spacing?" data-help="help-sample">?</button>
+      </span>
+      <span class="unit-field">
+        <input name="sample_spacing" type="number" step="0.1" min="0.1" value="1">
+        <span>m</span>
+      </span>
+      <span id="help-sample" class="help-pop" role="tooltip" hidden>
+        Distance between DEM elevation samples on each transect. Smaller values capture more of the channel shape.
+      </span>
+    </label>
+
+    <div class="field">
+      <span class="field-label">
+        Flood hydrology
+        <button type="button" class="help" aria-label="Where do the flood flows come from?" data-help="help-hydro">?</button>
+      </span>
+      <span id="help-hydro" class="help-pop" role="tooltip" hidden>
+        Looks up the REC1 river reach nearest the pin on the NIWA Henderson & Collins flood statistics layer and shows the design flows. Matching 10, 50, 100 and 1,000-year values can be copied into the return periods below. There is no 25-year estimate on that layer.
+      </span>
+      <button type="button" id="open-hydrology" class="secondary clip-dem">NIWA flood flows</button>
+    </div>
+
+    <fieldset class="field ari-field">
+      <legend class="field-label">
+        Return period (ARI)
+        <button type="button" class="help" aria-label="What is a return period?" data-help="help-ari">?</button>
+      </legend>
+      <span id="help-ari" class="help-pop" role="tooltip" hidden>
+        Annual Recurrence Interval. Select one or more design floods and enter the flow for each. Water level and velocity for every selected ARI overlay on the same profile, with the centreline slope shown on the long section.
+      </span>
+      <p class="muted">Select one or more intervals. Enter Q for each selected ARI. Profiles overlay on the same plot.</p>
+      <div class="ari-list" id="ari-list">
+        <label class="ari-row">
+          <input type="checkbox" data-ari="10" aria-label="10-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#0284c7"></i> 10-year</span>
+          <span class="unit-field">
+            <input name="flow_10" type="number" step="0.1" min="0" value="5" disabled>
+            <span>m³/s</span>
+          </span>
+        </label>
+        <label class="ari-row">
+          <input type="checkbox" data-ari="25" aria-label="25-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#059669"></i> 25-year</span>
+          <span class="unit-field">
+            <input name="flow_25" type="number" step="0.1" min="0" value="7" disabled>
+            <span>m³/s</span>
+          </span>
+        </label>
+        <label class="ari-row">
+          <input type="checkbox" data-ari="50" aria-label="50-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#d97706"></i> 50-year</span>
+          <span class="unit-field">
+            <input name="flow_50" type="number" step="0.1" min="0" value="8.5" disabled>
+            <span>m³/s</span>
+          </span>
+        </label>
+        <label class="ari-row">
+          <input type="checkbox" data-ari="100" checked aria-label="100-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#7c3aed"></i> 100-year</span>
+          <span class="unit-field">
+            <input name="flow_100" type="number" step="0.1" min="0" value="10">
+            <span>m³/s</span>
+          </span>
+        </label>
+        <label class="ari-row">
+          <input type="checkbox" data-ari="1000" aria-label="1,000-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#be123c"></i> 1,000-year</span>
+          <span class="unit-field">
+            <input name="flow_1000" type="number" step="0.1" min="0" value="22" disabled>
+            <span>m³/s</span>
+          </span>
+        </label>
+      </div>
+      <input type="hidden" name="aris" id="aris-json" value="">
+      <input type="hidden" name="flow" id="flow-primary" value="10">
+    </fieldset>
+
+    <label class="field">
+      <span class="field-label">
+        Manning’s n
+        <button type="button" class="help" aria-label="What is Manning’s n?" data-help="help-n">?</button>
+      </span>
+      <span class="unit-field">
+        <input name="mannings_n" type="number" step="0.001" min="0.001" value="0.035">
+        <span></span>
+      </span>
+      <span id="help-n" class="help-pop" role="tooltip" hidden>
+        Channel roughness. Higher n means more resistance, so a higher water level for the same flow. Typical gravel channels are around 0.03–0.04.
+      </span>
+    </label>
+
+    <fieldset class="field slope-field">
+      <legend class="field-label">
+        Bed slope S
+        <button type="button" class="help" aria-label="What is bed slope?" data-help="help-slope">?</button>
+      </legend>
+      <span id="help-slope" class="help-pop" role="tooltip" hidden>
+        Energy slope for Manning’s equation, as rise over run (m/m), not a percent. 0.002 is 1 in 500. Calculated uses the absolute slope of a straight line fitted to DEM elevations along the centreline. Specified replaces that value for the water level. The long-section line still shows the DEM fit.
+      </span>
+      <div class="slope-list">
+        <label class="slope-row">
+          <input type="radio" name="slope_mode" value="calculated" checked>
+          <span>Calculated from the centreline</span>
+        </label>
+        <label class="slope-row">
+          <input type="radio" name="slope_mode" value="specified">
+          <span class="slope-specified">
+            <span>Specified slope</span>
+            <span class="unit-field">
+              <input id="slope-value" name="slope" type="number" step="0.0001" min="0.000001" max="1" value="0.002" disabled>
+              <span>m/m</span>
+            </span>
+          </span>
+        </label>
+      </div>
+    </fieldset>
+
+    <div class="field">
+      <span class="field-label">
+        Elevation data
+        <button type="button" class="help" aria-label="What elevation data is used?" data-help="help-dem">?</button>
+      </span>
+      <p class="muted" id="dem-source-note">New Zealand LiDAR 1 m DEM (LINZ layer 121859). HydroBridge downloads each Topo50 sheet the rectangle touches into outputs/linz-tiles, then crops the area of interest from those files. Coverage follows those LiDAR sheets, not a continuous DEM for all of New Zealand. Each screening run saves that 1 m crop in outputs/dems and reuses it next time.</p>
+      <span id="help-dem" class="help-pop" role="tooltip" hidden>
+        Clip DEM downloads the LINZ 1 m sheets that intersect the orange polygon, then crops the rectangle from those files. A site outside every indexed sheet, or on nodata inside a sheet, has no elevation. Nothing is fetched until you click Clip DEM or Run screening. The 1 m crop used for screening is saved under outputs/dems.
+      </span>
+    </div>
+
+    <input id="lat" name="lat" type="hidden">
+    <input id="lon" name="lon" type="hidden">
+    <input id="along" name="along" type="hidden" value="300">
+
+    <div class="run-actions">
+      <button type="submit" id="run-btn" class="primary" aria-disabled="true">Run screening</button>
+      <button type="button" id="stop-btn" class="stop" hidden>Stop screening</button>
+      <p id="run-status" class="status" role="status"></p>
+    </div>
+  </form>
+  </div>
+
+  <section id="xs-viewer" class="xs-viewer" hidden>
+    <div class="xs-head">
+      <h2 id="xs-title">DEM cross-section</h2>
+      <p id="xs-meta" class="muted">Left-click two points on the map.</p>
+    </div>
+    <canvas id="xs-canvas" aria-label="DEM elevation along the drawn line"></canvas>
+  </section>
+  </div>
+
+  <div id="hydro-modal" class="modal" hidden>
+    <div class="card modal-card hydro-card" role="dialog" aria-labelledby="hydro-title" aria-modal="true">
+      <h2 id="hydro-title">Hydrology</h2>
+      <p id="hydro-status" class="muted">Looking up the nearest river reach…</p>
+      <div id="hydro-body" hidden>
+        <p id="hydro-reach"></p>
+        <div class="hydro-table-wrap">
+          <table class="hydro-table">
+            <thead>
+              <tr>
+                <th>Return period</th>
+                <th>Flow (m³/s)</th>
+                <th>Std. error (m³/s)</th>
+              </tr>
+            </thead>
+            <tbody id="hydro-flows"></tbody>
+          </table>
+        </div>
+        <p id="hydro-note" class="muted"></p>
+        <p class="muted">The layer has no 25-year estimate, so that flow is left as you entered it. 5-year and 20-year values are shown here only.</p>
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="hydro-close" class="ghost">Close</button>
+        <a id="hydro-source" class="ghost hydro-link" href="https://niwa.maps.arcgis.com/apps/instant/lookup/index.html?appid=dbcaedb2073b41b6993bd0155e5d8c53" target="_blank" rel="noopener">NIWA map</a>
+        <button type="button" id="hydro-apply" class="primary" disabled>Use matching flows</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="name-modal" class="modal" hidden>
+    <form id="name-form" class="card modal-card">
+      <h2>Name this bridge</h2>
+      <p class="muted">The pin marks the site that will be screened. Give it a name so it shows up in the legend.</p>
+      <label class="field">
+        <span class="field-label">Bridge name</span>
+        <input id="bridge-name" type="text" maxlength="80" required placeholder="e.g. Colombo Street Bridge" autocomplete="off">
+      </label>
+      <p id="name-coords" class="muted"></p>
+      <div class="modal-actions">
+        <button type="button" id="name-cancel" class="ghost">Cancel</button>
+        <button type="submit" class="primary">Pin bridge</button>
+      </div>
+    </form>
+  </div>
+
+  <section id="results" class="results" hidden>
+    <div class="results-head">
+      <h2>Screening results</h2>
+      <div class="results-actions">
+        <button type="button" id="results-ari-toggle" class="ghost" hidden>Collapse return periods</button>
+        <a id="summary-link" href="#" hidden>Download results workbook</a>
+      </div>
+    </div>
+    <p id="results-note" class="muted"></p>
+    <div class="table-wrap results-scroll" id="results-blocks"></div>
+    <div id="plots" class="plots"></div>
+  </section>
+
+  <div id="xs-measure" class="xs-measure" hidden role="status" aria-live="polite">0.0 m</div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=scroll-bottom"></script>
+</body>
+</html>
