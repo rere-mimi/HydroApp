@@ -4,10 +4,6 @@ Hydraulic screening MVP for rapidly extracting DEM cross-sections at bridge site
 
 The tool accepts coordinates, clips the [New Zealand LiDAR 1m DEM](https://data.linz.govt.nz/layer/121859-new-zealand-lidar-1m-dem/) around the site, identifies a stream centreline from OpenStreetMap (or a line you draw), generates transects, samples elevations, plots cross-sections, exports CSV/Excel, and solves water level from Manning’s equation.
 
-## Share with a colleague
-
-Send them [INSTALL.md](INSTALL.md). Do not copy your `.venv` folder. Each computer makes its own.
-
 ## Requirements
 
 - Python 3.11 or 3.12 (3.13+ often breaks the GIS wheels on Windows)
